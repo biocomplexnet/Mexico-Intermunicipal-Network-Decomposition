@@ -1,0 +1,163 @@
+list_pd_daily = {}  # Dictionary to store the daily data (from/to movements) for each day as pandas DataFrames.
+
+# Read CSV files from the directory './intermunicipal_od/' and store them in the dictionary
+for name in os.listdir('./intermunicipal_od/'):  
+    if name[0] != '.':  # Skip hidden files (those starting with a dot, e.g., .DS_Store)
+        # Load the CSV file and store it in the dictionary. 
+        # The key is the file name (excluding the first 18 characters and '.csv').
+        list_pd_daily[name[18:-4]] = pd.read_csv(f'./intermunicipal_od/{name}', dtype={'from': str, 'to': str})
+
+# Sort the dictionary by date (assumed to be encoded in the file names) for chronological processing.
+list_pd_daily = dict(sorted(list_pd_daily.items()))
+
+# Convert 'from' and 'to' columns to strings in all DataFrames (important for consistency in node identifiers).
+for name, df in list_pd_daily.items():
+    list_pd_daily[name]["from"] = list_pd_daily[name]["from"].astype(str)
+    list_pd_daily[name]["to"] = list_pd_daily[name]["to"].astype(str)
+
+list_g_daily = {}  # Dictionary to store daily networkx Graphs built from 'from'/'to' DataFrames.
+lst_k_core = {}  # Dictionary to store the k-core results of daily graphs.
+
+# Create a network graph for each day based on 'from'/'to' movements in the DataFrame.
+for name, df in list_pd_daily.items():
+    ori_dest = nx.Graph()  # Initialize a new empty undirected graph for each day.
+    
+    # Iterate through the DataFrame rows and add edges between 'from' and 'to' nodes with associated attributes.
+    for index, row in df.iterrows():
+        ori_dest.add_edge(row['from'], row['to'], count=row['count'], weight=row['weight'], date=row['date'])  # Add edge with attributes.
+
+    list_g_daily[name] = ori_dest  # Store the resulting graph in the dictionary.
+
+loc_comps = {}  # Dictionary to store the local components of each daily network.
+glob_comps = {}  # Dictionary to store the global components of each daily network.
+modularities = {}  # Dictionary to store modularity scores for each daily network.
+all_communities = {}  # Dictionary to store the communities detected in each daily network.
+
+# For each daily graph, compute communities and analyze local/global components.
+for name, g in list_g_daily.items():
+    # Apply the Louvain algorithm to detect communities in the graph. 
+    # The 'randomize' parameter ensures reproducibility.
+    communities = algorithms.louvain(g, randomize=123)
+    
+    # Compute local components by removing inter-community edges (within-community connectivity).
+    loc_comps[name] = local_component(g, communities.communities)
+    
+    # Compute global components by removing intra-community edges (between-community connectivity).
+    glob_comps[name] = global_component(g, communities.communities)
+    
+    # Store the identified communities.
+    all_communities[name] = communities
+    
+    # Calculate the modularity score for the communities detected (a measure of the strength of community structure).
+    modularities[name] = communities.newman_girvan_modularity().score
+
+
+
+def local_component(graph, communities):
+    '''
+    Function to extract the local components of a network (local communities)
+    Input: 
+      - graph: A networkx graph representing the entire network
+      - communities: A list of lists (from cdlib library), where each sublist contains the nodes of a community
+    Output: 
+      - list_community: A list of subgraphs, each representing a local community with node attributes
+    '''
+    list_community = []  # List to store subgraphs representing local communities
+    
+    # For each community, create a subgraph and assign a unique label
+    for i, community in enumerate(communities):
+        g = graph.subgraph(community)  # Extract subgraph for each community
+        labels = []
+        labels.append(f'comp_{i}')  # Add a label based on the community index
+        nx.set_node_attributes(g, labels, "num_comp")  # Set a 'num_comp' attribute for each node in the subgraph
+        list_community.append(g)  # Append the subgraph to the list of local communities
+    
+    return list_community  # Return the list of subgraphs (local communities)
+
+def global_component(graph, communities):
+    '''
+        Function to extract the global components of a network (inter-community connections)
+        Input: 
+          - graph: A networkx graph representing the entire network
+          - communities: A list of lists, where each sublist contains the nodes of a community
+        Output: 
+          - g_community: A list of subgraphs representing global components (inter-community connections)
+    '''
+    
+    g = nx.Graph()  # Create a new graph object
+    g.add_edges_from(graph.edges(data=True))  # Add all edges from the original graph to the new graph
+    g_community = []  # List to store subgraphs representing global components
+    l_edges = []  # Temporary list to store edges
+
+    # For each community, remove intra-community edges (internal connections within the community)
+    for i in range(len(communities)):
+        intra_community = graph.subgraph(communities[i])  # Extract intra-community subgraphs
+        for edge in intra_community.edges():  # Remove each intra-community edge from the global graph
+            g.remove_edge(*edge)
+
+    # Remove isolated nodes (nodes with no neighbors) after removing intra-community edges
+    for node in g.copy().nodes():   
+        if not list(g.neighbors(node)):  # Check if a node has no neighbors
+            l_edges.append(list(g.neighbors(node)))  # Add node's neighbors to the temporary list
+            g.remove_node(node)  # Remove the isolated node from the graph
+
+    # Create a new graph from the remaining edges (inter-community connections)
+    g_networks = nx.Graph()
+    g_networks.add_edges_from(g.edges(data=True))
+    
+    # Identify connected components in the remaining graph
+    a = nx.connected_components(g_networks)
+    
+    # For each connected component, create a subgraph and add it to the list of global components
+    for subgraph in a:
+        g_community.append(g_networks.subgraph(subgraph))
+        
+    return g_community  # Return the list of subgraphs (global components)
+
+
+
+def list_k_core_whole_network(list_g_daily):
+    '''
+    Core of the whole network
+    Input: 
+      - list_g_daily: A dictionary where each key is a date and each value is a networkx graph representing the network on that date.
+        For example, the dictionary could look like {'2023-01-01': G1, '2023-01-02': G2}, where G1 and G2 are networkx graph objects.
+      
+    Output:
+      - lst_all_core_node: A list of lists, where each sublist contains the nodes in the k-core of the network for each date.
+        For example, the output could look like [['node1', 'node2'], ['node3', 'node4']] where each sublist corresponds to the k-core nodes of a specific date's network.
+    '''
+
+    lst_k_core = {}  # Dictionary to store the k-core of each network snapshot by date.
+    lst_all_core_node = []  # List to store the nodes present in the k-core of each daily network.
+
+    # Loop through each date in the network snapshots
+    for name, g in list_g_daily.items():
+        lst_k_core[name] = nx.k_core(g)  # Calculate the k-core for the graph on that specific date.
+        lst_all_core_node.append(list(lst_k_core[name].nodes))  # Append the list
+
+    retun lst_all_core_node
+    
+def list_k_core_component(components, selected_date=None):
+    '''
+    Function to compute the k-core of components (local or global components)
+    Input: 
+      - components: A dictionary where keys are dates and values are lists of subgraphs (components)
+      - selected_date: (Optional) A list of selected dates to compute the k-core for; if None, use all available dates
+    Output: 
+      - lst_core: A dictionary where each key is a date, and each value is a list of k-cores for each component on that date
+    '''
+    
+    lst_core = {}  # Dictionary to store k-core of each component
+    if not selected_date:  # If no specific date is selected, use all available dates
+        lst_name = lst_core.keys()
+    else:
+        lst_name = selected_date  # Use only the selected dates
+    
+    # Compute the k-core for each component at each selected date
+    for name in lst_name:
+        lst_core[name] = []  # Initialize a list to store the k-core for each component on the given date
+        for i, comp in enumerate(components[name]):
+            lst_core[name].append(nx.k_core(comp))  # Compute and append the k-core of the component to the list
+                
+    return lst_core  # Return the dictionary of k-core components
